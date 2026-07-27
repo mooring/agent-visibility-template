@@ -1,52 +1,45 @@
-# AGENTS.md — Agent Visibility Template
+# AGENTS.md — Image Generation Console
 
 Notes for AI agents working on this template.
 
-## What this template is
+## What this project is
 
-One enriched content store (`Resource[]`) projected onto many agent-discovery
-surfaces. The data is enriched once by Workers AI and cached in KV; every
-surface (`/llms.txt`, `/index.json`, `/<slug>.md`, `/robots.txt`, JSON-LD) is
-just a different rendering of that same store.
+A Cloudflare Worker proxy plus React console for OpenAI-compatible image
+generation endpoints. The browser collects a token, complete public HTTPS URL,
+model, prompt, standard parameters, and optional JSON; the Worker validates and
+forwards one request, then returns normalized images and redacted diagnostics.
 
 ## Architecture
 
 ```
 src/
-  worker/index.ts        Hono app: routes for every surface + JSON API
-  enrichment/index.ts    Workers AI enrichment (raw page -> structured Resource)
-  enrichment/surfaces.ts Pure render functions, one per surface
-  lib/store.ts           KV-backed enriched store (get / upsert / clear)
-  lib/content.ts         Sample content (zero-config demo data)
-  lib/types.ts           Shared types (Resource, RawResource, Env, SiteConfig)
-  lib/web-bot-auth.ts    OPTIONAL agent-identity module (off by default)
-  react-app/             Surface-explorer UI
-test/index.test.ts       Worker tests (vitest-pool-workers, via SELF.fetch)
+  worker/index.ts             Hono image generation proxy route
+  lib/image-generation.ts    Shared validation, redaction, and response types
+  react-app/App.tsx           Image generation console
+  react-app/generation-form.ts Pure form-to-request body builder
+test/index.test.ts            Worker integration tests with intercepted fetches
+test/image-generation.test.ts Pure validation and redaction tests
 ```
 
 ## Conventions
 
-- **`surfaces.ts` is pure.** Render functions take `RenderCtx` and return
-  strings/objects. No I/O. This keeps surfaces easy to test and add to.
-- **Enrichment must never hard-fail.** `enrichResource` falls back to
-  `fallbackEnrichment` on any model/parse error so surfaces always render.
-- **Keep readability and identity separate.** Web Bot Auth is about _who_ an
-  agent is, not _what_ it can read. It lives in its own module and is gated by
-  `ENABLE_WEB_BOT_AUTH`. Don't wire it into the core surfaces.
+- Never persist or log the user token, authorization values, cookies, prompt
+  contents, URL query strings/fragments, or Base64 image contents.
+- Only accept complete public HTTPS upstream URLs and never follow redirects.
+- Keep upstream response reading bounded and do not add automatic retries.
+- Keep form body construction and Worker validation as pure testable helpers.
 
-## Adding a surface
+## Adding a request parameter
 
-1. Add a pure renderer to `src/enrichment/surfaces.ts`.
-2. Add a route in `src/worker/index.ts` (send the `Content-Signal` header for
-   text/JSON surfaces; add `cors()` if agents fetch it cross-origin).
-3. Add it to the `/api/site` `surfaces` list so the UI shows it.
-4. Add a test in `test/index.test.ts`.
+1. Add the fixed UI field only when it is part of the supported shared contract.
+2. Map it in `src/react-app/generation-form.ts`; omit it when empty.
+3. Add any required bounds to `src/lib/image-generation.ts`.
+4. Cover both client merging and Worker validation in focused tests.
 
 ## Validating changes
 
 ```bash
+npm test        # intercepted upstream requests; no paid API calls
 npm run build   # tsc -b && vite build
-npm test        # vitest (hits live Workers AI — needs credentials)
+npm run check   # build + Cloudflare deploy --dry-run
 ```
-
-After editing `wrangler.jsonc`, rerun `npx wrangler types`.

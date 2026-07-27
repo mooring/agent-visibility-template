@@ -1,275 +1,97 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
+import type { DiagnosticEvent, GenerationImage } from "../lib/image-generation";
+import { buildGenerationBody, type GenerationFields } from "./generation-form";
 import "./App.css";
 
-interface Surface {
-	id: string;
-	label: string;
-	path: string;
-	kind: "text" | "json";
+interface ApiResponse {
+	requestId?: string;
+	images?: GenerationImage[];
+	logs?: DiagnosticEvent[];
+	error?: { message: string };
+	upstream?: { body?: string };
 }
 
-interface SiteInfo {
-	site: { name: string; description: string; origin: string };
-	webBotAuthEnabled: boolean;
-	surfaces: Surface[];
-}
-
-interface Resource {
-	slug: string;
-	title: string;
-	summary: string;
-	topics: string[];
-	category: string | null;
-}
-
-function useSiteInfo() {
-	const [info, setInfo] = useState<SiteInfo | null>(null);
-	const [error, setError] = useState<string | null>(null);
-	const [loading, setLoading] = useState(true);
-	useEffect(() => {
-		async function loadSiteInfo() {
-			try {
-				const response = await fetch("/api/site");
-				if (!response.ok) {
-					throw new Error(
-						`/api/site returned ${response.status} ${response.statusText}`.trim(),
-					);
-				}
-				setInfo(await response.json());
-				setError(null);
-			} catch (error) {
-				setInfo(null);
-				setError(
-					error instanceof Error ? error.message : "Could not load /api/site.",
-				);
-			} finally {
-				setLoading(false);
-			}
-		}
-
-		void loadSiteInfo();
-	}, []);
-	return { info, loading, error };
-}
-
-function SurfacePreview({ surface }: { surface: Surface }) {
-	const [open, setOpen] = useState(false);
-	const [body, setBody] = useState<string>("");
-	const [error, setError] = useState<string | null>(null);
-	const [loading, setLoading] = useState(false);
-	const [copied, setCopied] = useState(false);
-
-	async function load() {
-		setLoading(true);
-		setError(null);
-		try {
-			const res = await fetch(surface.path);
-			if (!res.ok) {
-				throw new Error(
-					`${surface.path} returned ${res.status} ${res.statusText}`.trim(),
-				);
-			}
-			const text = await res.text();
-			if (surface.kind === "json") {
-				try {
-					setBody(JSON.stringify(JSON.parse(text), null, 2));
-				} catch (error) {
-					throw new Error(
-						`${surface.path} returned invalid JSON${
-							error instanceof Error ? `: ${error.message}` : "."
-						}`,
-					);
-				}
-			} else {
-				setBody(text);
-			}
-		} catch (error) {
-			setBody("");
-			setError(
-				error instanceof Error
-					? error.message
-					: `Could not load ${surface.path}.`,
-			);
-		} finally {
-			setLoading(false);
-		}
-	}
-
-	function toggle() {
-		const next = !open;
-		setOpen(next);
-		if (next && !body) load();
-	}
-
-	async function copy() {
-		if (!body) return;
-		await navigator.clipboard.writeText(body);
-		setCopied(true);
-		setTimeout(() => setCopied(false), 1500);
-	}
-
-	return (
-		<div className="surface">
-			<div className="surface-head">
-				<div>
-					<span className="surface-label">{surface.label}</span>
-					<code className="surface-path">{surface.path}</code>
-				</div>
-				<div className="surface-actions">
-					<a href={surface.path} target="_blank" rel="noreferrer">
-						Open ↗
-					</a>
-					<button onClick={toggle}>{open ? "Hide" : "Preview"}</button>
-				</div>
-			</div>
-			{open && (
-				<div className="surface-body">
-					{loading ? (
-						<p className="muted">Loading…</p>
-					) : error ? (
-						<div className="error" role="alert">
-							<strong>Preview unavailable.</strong>
-							<p>{error}</p>
-							<p>Open the surface directly or check the Worker logs.</p>
-						</div>
-					) : (
-						<>
-							<button className="copy" onClick={copy}>
-								{copied ? "Copied" : "Copy"}
-							</button>
-							<pre>{body}</pre>
-						</>
-					)}
-				</div>
-			)}
-		</div>
-	);
-}
+const INITIAL: GenerationFields = {
+	model: "gpt-image-1", prompt: "", extra: "{}", n: "1", size: "1024x1024",
+	quality: "", style: "", responseFormat: "", background: "", outputCompression: "", user: "",
+};
 
 export default function App() {
-	const { info, loading: siteLoading, error: siteError } = useSiteInfo();
-	const [resources, setResources] = useState<Resource[]>([]);
-	const [resourcesLoading, setResourcesLoading] = useState(true);
-	const [resourcesError, setResourcesError] = useState<string | null>(null);
+	const [token, setToken] = useState("");
+	const [url, setUrl] = useState("https://api.openai.com/v1/images/generations");
+	const [showToken, setShowToken] = useState(false);
+	const [fields, setFields] = useState(INITIAL);
+	const [loading, setLoading] = useState(false);
+	const [images, setImages] = useState<GenerationImage[]>([]);
+	const [stale, setStale] = useState(false);
+	const [logs, setLogs] = useState<DiagnosticEvent[]>([]);
 
-	useEffect(() => {
-		async function loadResources() {
-			try {
-				const response = await fetch("/api/resources");
-				if (!response.ok) {
-					throw new Error(
-						`/api/resources returned ${response.status} ${response.statusText}`.trim(),
-					);
-				}
-				const data = await response.json();
-				setResources(data.resources ?? []);
-				setResourcesError(null);
-			} catch (error) {
-				setResources([]);
-				setResourcesError(
-					error instanceof Error
-						? error.message
-						: "Could not load /api/resources.",
-				);
-			} finally {
-				setResourcesLoading(false);
+	function addLog(level: DiagnosticEvent["level"], message: string) {
+		setLogs((current) => [...current, { time: new Date().toISOString(), level, message }]);
+	}
+
+	function setField<K extends keyof GenerationFields>(key: K, value: GenerationFields[K]) {
+		setFields((current) => ({ ...current, [key]: value }));
+	}
+
+	async function submit(event: React.FormEvent) {
+		event.preventDefault();
+		if (!token.trim()) { addLog("ERROR", "Token is required."); return; }
+		if (!url.trim()) { addLog("ERROR", "Complete API URL is required."); return; }
+		let body: Record<string, unknown>;
+		try { body = buildGenerationBody(fields); }
+		catch (error) { addLog("ERROR", (error as Error).message); return; }
+		setLoading(true);
+		setStale(images.length > 0);
+		addLog("INFO", `Sending request to ${safeHost(url)} with prompt length ${fields.prompt.length}.`);
+		try {
+			const response = await fetch("/api/images/generations", {
+				method: "POST", headers: { "content-type": "application/json" },
+				body: JSON.stringify({ url, token, body }),
+			});
+			const data = await response.json() as ApiResponse;
+			if (data.logs) setLogs((current) => [...current, ...data.logs!]);
+			if (!response.ok || !data.images) {
+				if (data.upstream?.body) addLog("ERROR", `Upstream response:\n${data.upstream.body}`);
+				throw new Error(data.error?.message || `Worker returned HTTP ${response.status}.`);
 			}
-		}
-
-		void loadResources();
-	}, []);
-
-	if (siteLoading) {
-		return (
-			<main className="container">
-				<p className="muted">Loading…</p>
-			</main>
-		);
+			setImages(data.images);
+			setStale(false);
+		} catch (error) {
+			addLog("ERROR", error instanceof Error ? error.message : "Image generation failed.");
+			setStale(images.length > 0);
+		} finally { setLoading(false); }
 	}
 
-	if (!info) {
-		return (
-			<main className="container">
-				<div className="error" role="alert">
-					<strong>Could not load site metadata.</strong>
-					<p>{siteError ?? "The /api/site response was empty."}</p>
-					<p>Refresh the page or check the Worker logs for /api/site.</p>
-				</div>
-			</main>
-		);
+	async function copyLogs() {
+		await navigator.clipboard.writeText(logs.map((log) => `${log.time} ${log.level} ${log.message}`).join("\n"));
 	}
 
-	return (
-		<main className="container">
-			<header>
-				<p className="kicker">AI Agent Visibility</p>
-				<h1>{info.site.name}</h1>
-				<p className="lede">{info.site.description}</p>
-				<p className="muted">
-					One enriched content store, served to AI agents through every
-					discovery surface below — generated by Workers AI, cached in KV.
-				</p>
-			</header>
+	return <main className="shell">
+		<header className="hero"><p className="eyebrow">Cloudflare Worker Proxy</p><h1>Image Generation Console</h1><p>Call any OpenAI-compatible public HTTPS image endpoint and inspect safe, detailed diagnostics in one place.</p></header>
+		<div className="workspace">
+			<form className="panel form" onSubmit={submit}>
+				<div className="panel-heading"><div><span>Request</span><h2>Generation settings</h2></div><span className="privacy">Token stays in memory</span></div>
+				<label className="wide">Token<div className="secret"><input type={showToken ? "text" : "password"} value={token} onChange={(e) => setToken(e.target.value)} autoComplete="off" placeholder="sk-…" /><button type="button" onClick={() => setShowToken(!showToken)}>{showToken ? "Hide" : "Show"}</button></div></label>
+				<label className="wide">Complete API URL<input type="url" value={url} onChange={(e) => setUrl(e.target.value)} required /></label>
+				<label>Model<input value={fields.model} onChange={(e) => setField("model", e.target.value)} required /></label>
+				<label>Number<input type="number" min="1" max="10" value={fields.n} onChange={(e) => setField("n", e.target.value)} /></label>
+				<label className="wide">Prompt<textarea rows={6} value={fields.prompt} onChange={(e) => setField("prompt", e.target.value)} placeholder="Describe the image you want…" required /></label>
+				{(["size", "quality", "style", "responseFormat", "background", "outputCompression", "user"] as const).map((key) => <label key={key}>{labelFor(key)}<input type={key === "outputCompression" ? "number" : "text"} min={key === "outputCompression" ? 0 : undefined} max={key === "outputCompression" ? 100 : undefined} value={fields[key]} onChange={(e) => setField(key, e.target.value)} /></label>)}
+				<label className="wide">Extra parameters (JSON)<textarea className="code" rows={6} value={fields.extra} onChange={(e) => setField("extra", e.target.value)} spellCheck={false} /></label>
+				<button className="primary wide" disabled={loading}>{loading ? "Generating…" : "Generate image"}</button>
+			</form>
 
-			<section>
-				<h2>Agent surfaces</h2>
-				<p className="muted">
-					The same content, in whichever convention an agent prefers.
-				</p>
-				<div className="surfaces">
-					{info.surfaces.map((s) => (
-						<SurfacePreview key={s.id} surface={s} />
-					))}
+			<section className="right-column">
+				<div className="panel results"><div className="panel-heading"><div><span>Output</span><h2>Generated images</h2></div>{stale && <span className="stale">Previous successful request</span>}</div>
+					{images.length === 0 ? <div className="empty"><span>◇</span><p>Your generated images will appear here.</p></div> : <div className="gallery">{images.map((image, index) => <article className="image-card" key={`${index}-${image.url || image.b64Json?.slice(0, 12)}`}><img src={image.url || `data:${image.mimeType};base64,${image.b64Json}`} alt={`Generated result ${index + 1}`} onError={() => addLog("ERROR", `Image ${index + 1} could not be loaded.`)} /><div><strong>Result {index + 1}</strong>{image.url ? <a href={image.url} target="_blank" rel="noreferrer">Open original ↗</a> : <a href={`data:${image.mimeType};base64,${image.b64Json}`} download={`generated-${index + 1}.${extension(image.mimeType)}`}>Download</a>}</div></article>)}</div>}
 				</div>
-				{info.webBotAuthEnabled && (
-					<p className="muted">
-						Web Bot Auth identity surface is <strong>enabled</strong> at{" "}
-						<code>/.well-known/web-bot-auth/directory</code>.
-					</p>
-				)}
+				<div className="panel logs"><div className="panel-heading"><div><span>Diagnostics</span><h2>Logs</h2></div><div className="actions"><button type="button" onClick={copyLogs} disabled={!logs.length}>Copy</button><button type="button" onClick={() => setLogs([])} disabled={!logs.length}>Clear</button></div></div><div className="log-stream" aria-live="polite">{logs.length === 0 ? <p className="empty-log">No requests yet.</p> : logs.map((log, index) => <div className={`log ${log.level.toLowerCase()}`} key={`${log.time}-${index}`}><time>{new Date(log.time).toLocaleTimeString()}</time><b>{log.level}</b><pre>{log.message}</pre></div>)}</div></div>
 			</section>
-
-			<section>
-				<h2>Indexed pages ({resources.length})</h2>
-				{resourcesLoading ? (
-					<p className="muted">Loading indexed pages…</p>
-				) : resourcesError ? (
-					<div className="error" role="alert">
-						<strong>Could not load indexed pages.</strong>
-						<p>{resourcesError}</p>
-						<p>Check /api/resources or the Worker logs, then refresh.</p>
-					</div>
-				) : resources.length === 0 ? (
-					<p className="muted">
-						No indexed pages returned from /api/resources.
-					</p>
-				) : (
-					<div className="cards">
-						{resources.map((r) => (
-							<article className="card" key={r.slug}>
-								<h3>
-									<a href={`/${r.slug}.md`} target="_blank" rel="noreferrer">
-										{r.title}
-									</a>
-								</h3>
-								{r.category && <span className="tag">{r.category}</span>}
-								<p>{r.summary}</p>
-								{r.topics.length > 0 && (
-									<p className="topics">{r.topics.join(" · ")}</p>
-								)}
-							</article>
-						))}
-					</div>
-				)}
-			</section>
-
-			<footer>
-				<p className="muted">
-					Built on Cloudflare Workers + Workers AI + KV. Replace the sample
-					content in <code>src/lib/content.ts</code> or POST your own pages to{" "}
-					<code>/api/resources</code>.
-				</p>
-			</footer>
-		</main>
-	);
+		</div>
+	</main>;
 }
+
+function safeHost(value: string) { try { const u = new URL(value); return `${u.protocol}//${u.host}`; } catch { return "the configured endpoint"; } }
+function extension(mime: string) { return mime.split("/")[1]?.replace("jpeg", "jpg") || "png"; }
+function labelFor(key: keyof GenerationFields) { return ({ size: "Size", quality: "Quality", style: "Style", responseFormat: "Response format", background: "Background", outputCompression: "Output compression", user: "User" } as Record<string, string>)[key] || key; }

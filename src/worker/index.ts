@@ -1,302 +1,162 @@
-/**
- * Agent Visibility Worker
- *
- * Serves one enriched content store through every agent-discovery surface:
- *
- *   GET /llms.txt                          — llms.txt index (Markdown)
- *   GET /llms-full.txt                     — full content inlined (Markdown)
- *   GET /index.json                        — typed JSON index
- *   GET /:slug.md                          — per-page Markdown (groundable)
- *   GET /:slug.jsonld                      — per-page schema.org JSON-LD
- *   GET /jsonld                            — site-level schema.org JSON-LD
- *   GET /robots.txt                        — explicit AI-bot directives
- *
- * Plus a small JSON API the bundled UI uses, and an OPTIONAL Web Bot Auth
- * identity surface (disabled unless ENABLE_WEB_BOT_AUTH=true).
- *
- * Every text surface sends a `Content-Signal` header declaring how agents may
- * use the content (see https://contentsignals.org / the Content-Signals
- * proposal). The React SPA at `/` is served from static assets.
- */
 import { Hono } from "hono";
-import { cors } from "hono/cors";
 import {
-	renderIndexJson,
-	renderLlmsFullTxt,
-	renderLlmsTxt,
-	renderResourceJsonLd,
-	renderResourceMd,
-	renderRobotsTxt,
-	renderWebsiteJsonLd,
-} from "../enrichment/surfaces";
-import {
-	clearCache,
-	getResources,
-	siteConfig,
-	upsertResource,
-} from "../lib/store";
-import type { Env, RawResource } from "../lib/types";
-import {
-	directoryDocument,
-	SAMPLE_AGENT_KEYS,
-	verifyAgentIdentity,
-} from "../lib/web-bot-auth";
+	normalizeImageResponse,
+	redactDiagnosticText,
+	sanitizeRequestBody,
+	validateGenerationRequest,
+	validatePublicHttpsUrl,
+	type DiagnosticEvent,
+} from "../lib/image-generation";
 
-const app = new Hono<{ Bindings: Env }>();
+const app = new Hono();
+const MAX_REQUEST_BYTES = 128_000;
+const MAX_UPSTREAM_BYTES = 25 * 1024 * 1024;
+const UPSTREAM_TIMEOUT_MS = 110_000;
 
-app.onError((err, c) => {
-	console.error(`[Error] ${c.req.method} ${c.req.path}: ${err.message}`);
-	// Match the response type to the surface: text surfaces shouldn't get a
-	// JSON error body.
-	if (/\.(md|txt)$/.test(c.req.path)) {
-		return c.text("Internal server error", 500);
-	}
-	return c.json({ error: "Internal server error" }, 500);
-});
-
-function originOf(url: string): string {
-	return new URL(url).origin;
+function event(level: DiagnosticEvent["level"], message: string): DiagnosticEvent {
+	return { time: new Date().toISOString(), level, message };
 }
 
-// --- Validation limits for user-supplied content ---------------------------
-const MAX_BODY_BYTES = 100_000; // raw content we'll persist per resource
-const MAX_RESOURCES = 100; // cap total resources to bound KV growth
-const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,62})$/;
-
-/** Constant-time-ish bearer check for the mutating routes. */
-function isAuthorized(c: {
-	env: Env;
-	req: { header: (k: string) => string | undefined };
-}): boolean {
-	const configured = c.env.ADMIN_TOKEN;
-	if (!configured) return false;
-	const header = c.req.header("authorization") ?? "";
-	const token = header.replace(/^Bearer\s+/i, "");
-	return token.length > 0 && token === configured;
+function errorResponse(
+	requestId: string,
+	category: string,
+	message: string,
+	logs: DiagnosticEvent[],
+	status: 400 | 502 | 504,
+	upstream?: { status: number; statusText: string; body?: string; truncated?: boolean },
+) {
+	return { error: { category, message }, requestId, upstream, logs: [...logs, event("ERROR", message)], status };
 }
 
-/** Apply the Content-Signal header declaring agent usage intent. */
-function contentSignal(c: { env: Env }): Record<string, string> {
-	return {
-		"Content-Signal":
-			c.env.CONTENT_SIGNAL || "ai-input=yes, search=yes, ai-train=no",
-	};
-}
-
-// CORS so agents can fetch the machine-readable surfaces from anywhere.
-app.use("/llms.txt", cors());
-app.use("/llms-full.txt", cors());
-app.use("/index.json", cors());
-app.use("/jsonld", cors());
-// NB: Hono's "*" wildcard does not match a literal ".md"/".jsonld" suffix, so
-// the per-page surfaces need the same regex matcher their routes use.
-app.use("/:file{.+\\.md}", cors());
-app.use("/:file{.+\\.jsonld}", cors());
-
-// ---------------------------------------------------------------------------
-// Machine-readable surfaces
-// ---------------------------------------------------------------------------
-
-app.get("/llms.txt", async (c) => {
-	const site = siteConfig(c.env, originOf(c.req.url));
-	const resources = await getResources(c.env);
-	return c.text(renderLlmsTxt({ site, resources }), 200, {
-		"Content-Type": "text/plain; charset=utf-8",
-		...contentSignal(c),
-	});
-});
-
-app.get("/llms-full.txt", async (c) => {
-	const site = siteConfig(c.env, originOf(c.req.url));
-	const resources = await getResources(c.env);
-	return c.text(renderLlmsFullTxt({ site, resources }), 200, {
-		"Content-Type": "text/plain; charset=utf-8",
-		...contentSignal(c),
-	});
-});
-
-app.get("/index.json", async (c) => {
-	const site = siteConfig(c.env, originOf(c.req.url));
-	const resources = await getResources(c.env);
-	c.header("Content-Signal", contentSignal(c)["Content-Signal"]);
-	return c.json(renderIndexJson({ site, resources }));
-});
-
-app.get("/robots.txt", async (c) => {
-	const site = siteConfig(c.env, originOf(c.req.url));
-	const resources = await getResources(c.env);
-	return c.text(
-		renderRobotsTxt({
-			site,
-			resources,
-			contentSignal: contentSignal(c)["Content-Signal"],
-		}),
-		200,
-		{
-			"Content-Type": "text/plain; charset=utf-8",
-			...contentSignal(c),
-		},
-	);
-});
-
-app.get("/jsonld", async (c) => {
-	const site = siteConfig(c.env, originOf(c.req.url));
-	const resources = await getResources(c.env);
-	return c.json(renderWebsiteJsonLd({ site, resources }), 200, {
-		"Content-Type": "application/ld+json; charset=utf-8",
-		...contentSignal(c),
-	});
-});
-
-// Per-page Markdown: /:slug.md
-app.get("/:file{.+\\.md}", async (c) => {
-	const slug = c.req.param("file").replace(/\.md$/, "");
-	const site = siteConfig(c.env, originOf(c.req.url));
-	const resources = await getResources(c.env);
-	const resource = resources.find((r) => r.slug === slug);
-	if (!resource) return c.notFound();
-	return c.text(renderResourceMd({ resource, site }), 200, {
-		"Content-Type": "text/markdown; charset=utf-8",
-		...contentSignal(c),
-	});
-});
-
-// Per-page JSON-LD: /:slug.jsonld
-app.get("/:file{.+\\.jsonld}", async (c) => {
-	const slug = c.req.param("file").replace(/\.jsonld$/, "");
-	const site = siteConfig(c.env, originOf(c.req.url));
-	const resources = await getResources(c.env);
-	const resource = resources.find((r) => r.slug === slug);
-	if (!resource) return c.notFound();
-	return c.json(renderResourceJsonLd({ resource, site }), 200, {
-		"Content-Type": "application/ld+json; charset=utf-8",
-		...contentSignal(c),
-	});
-});
-
-// ---------------------------------------------------------------------------
-// JSON API for the bundled UI
-// ---------------------------------------------------------------------------
-
-app.get("/api/site", async (c) => {
-	const site = siteConfig(c.env, originOf(c.req.url));
-	return c.json({
-		site,
-		webBotAuthEnabled: c.env.ENABLE_WEB_BOT_AUTH === "true",
-		surfaces: [
-			{ id: "llms-txt", label: "llms.txt", path: "/llms.txt", kind: "text" },
-			{
-				id: "llms-full",
-				label: "llms-full.txt",
-				path: "/llms-full.txt",
-				kind: "text",
-			},
-			{
-				id: "index-json",
-				label: "index.json",
-				path: "/index.json",
-				kind: "json",
-			},
-			{ id: "robots", label: "robots.txt", path: "/robots.txt", kind: "text" },
-			{ id: "jsonld", label: "JSON-LD", path: "/jsonld", kind: "json" },
-		],
-	});
-});
-
-app.get("/api/resources", async (c) => {
-	const resources = await getResources(c.env);
-	return c.json({ count: resources.length, resources });
-});
-
-app.get("/api/resources/:slug", async (c) => {
-	const resources = await getResources(c.env);
-	const resource = resources.find((r) => r.slug === c.req.param("slug"));
-	if (!resource) return c.json({ error: "Not found" }, 404);
-	return c.json(resource);
-});
-
-app.post("/api/resources", async (c) => {
-	if (!isAuthorized(c)) {
-		return c.json({ error: "Unauthorized. Set the ADMIN_TOKEN secret." }, 401);
-	}
-	const body = await c.req.json<Partial<RawResource>>().catch(() => null);
-	if (!body?.slug || !body?.body) {
-		return c.json({ error: "Missing required fields: slug, body" }, 400);
-	}
-
-	const slug = String(body.slug);
-	if (!SLUG_RE.test(slug)) {
-		return c.json({ error: "Invalid slug: use 1–63 chars of [a-z0-9-]." }, 400);
-	}
-
-	const rawBody = String(body.body);
-	if (new TextEncoder().encode(rawBody).length > MAX_BODY_BYTES) {
-		return c.json(
-			{ error: `Body too large (max ${MAX_BODY_BYTES} bytes).` },
-			400,
-		);
-	}
-
-	let url = `${originOf(c.req.url)}/${slug}`;
-	if (body.url) {
-		try {
-			const parsed = new URL(String(body.url));
-			if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-				return c.json({ error: "url must be http(s)." }, 400);
-			}
-			url = parsed.toString();
-		} catch {
-			return c.json({ error: "url is not a valid URL." }, 400);
+async function readBounded(response: Response) {
+	if (!response.body) return { text: "", truncated: false };
+	const reader = response.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	let truncated = false;
+	while (true) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		const remaining = MAX_UPSTREAM_BYTES - total;
+		if (value.byteLength > remaining) {
+			if (remaining > 0) chunks.push(value.slice(0, remaining));
+			truncated = true;
+			await reader.cancel();
+			break;
 		}
+		chunks.push(value);
+		total += value.byteLength;
+	}
+	const bytes = new Uint8Array(chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0));
+	let offset = 0;
+	for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+	return { text: new TextDecoder().decode(bytes), truncated };
+}
+
+app.onError((error, c) => {
+	const requestId = crypto.randomUUID();
+	console.error(`[${requestId}] worker_error ${redactDiagnosticText(error.message)}`);
+	return c.json({
+		error: { category: "worker_error", message: "Unexpected Worker error." },
+		requestId,
+		logs: [event("ERROR", "Unexpected Worker error.")],
+	}, 500);
+});
+
+app.post("/api/images/generations", async (c) => {
+	const requestId = crypto.randomUUID();
+	const logs: DiagnosticEvent[] = [event("INFO", `Request ${requestId} received.`)];
+	const length = Number(c.req.header("content-length") ?? "0");
+	if (length > MAX_REQUEST_BYTES) {
+		const result = errorResponse(requestId, "validation_error", "Request body is too large.", logs, 400);
+		return c.json(result, result.status);
 	}
 
-	const raw: RawResource = {
-		slug,
-		url,
-		title: body.title ? String(body.title).slice(0, 200) : undefined,
-		body: rawBody,
-	};
+	const rawText = await c.req.text();
+	if (new TextEncoder().encode(rawText).byteLength > MAX_REQUEST_BYTES) {
+		const result = errorResponse(requestId, "validation_error", "Request body is too large.", logs, 400);
+		return c.json(result, result.status);
+	}
+
+	let input: unknown;
+	try { input = JSON.parse(rawText); }
+	catch {
+		const result = errorResponse(requestId, "validation_error", "Request body must be valid JSON.", logs, 400);
+		return c.json(result, result.status);
+	}
+
+	let request;
+	try { request = validateGenerationRequest(input); }
+	catch (error) {
+		const result = errorResponse(requestId, "validation_error", (error as Error).message, logs, 400);
+		return c.json(result, result.status);
+	}
+
+	const target = validatePublicHttpsUrl(request.url);
+	logs.push(event("INFO", `Validated public target ${target.safeTarget}.`));
+	logs.push(event("INFO", `Request parameters: ${JSON.stringify(sanitizeRequestBody(request.body))}`));
+	const startedAt = Date.now();
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+
+	let upstream: Response;
+	try {
+		upstream = await fetch(target.url, {
+			method: "POST",
+			headers: {
+				accept: "application/json",
+				authorization: `Bearer ${request.token}`,
+				"content-type": "application/json",
+			},
+			body: JSON.stringify(request.body),
+			redirect: "manual",
+			signal: controller.signal,
+		});
+	} catch (error) {
+		clearTimeout(timeout);
+		const timedOut = controller.signal.aborted;
+		const message = timedOut ? "Upstream request timed out." : "Could not reach the upstream service.";
+		console.error(`[${requestId}] upstream_network_error ${target.url.hostname} ${redactDiagnosticText((error as Error).message, [request.token])}`);
+		const result = errorResponse(requestId, timedOut ? "timeout" : "network_error", message, logs, timedOut ? 504 : 502);
+		return c.json(result, result.status);
+	}
+	clearTimeout(timeout);
+
+	const elapsedMs = Date.now() - startedAt;
+	const body = await readBounded(upstream);
+	logs.push(event("INFO", `Upstream returned ${upstream.status} ${upstream.statusText || ""} in ${elapsedMs} ms.`.trim()));
+	logs.push(event("INFO", `Response content type: ${upstream.headers.get("content-type") || "unknown"}.`));
+	if (body.truncated) logs.push(event("ERROR", `Upstream response exceeded ${MAX_UPSTREAM_BYTES} bytes and was truncated.`));
+
+	if (!upstream.ok || upstream.status >= 300) {
+		const safeBody = redactDiagnosticText(body.text, [request.token]);
+		const message = `Upstream request failed with ${upstream.status} ${upstream.statusText || ""}.`.trim();
+		const result = errorResponse(requestId, "upstream_error", message, logs, 502, {
+			status: upstream.status, statusText: upstream.statusText, body: safeBody, truncated: body.truncated,
+		});
+		return c.json(result, result.status);
+	}
+
+	if (body.truncated) {
+		const result = errorResponse(requestId, "response_too_large", "Successful upstream response was too large to process.", logs, 502);
+		return c.json(result, result.status);
+	}
+
+	let parsed: unknown;
+	try { parsed = JSON.parse(body.text); }
+	catch {
+		const result = errorResponse(requestId, "invalid_upstream_response", "Upstream returned invalid JSON.", logs, 502);
+		return c.json(result, result.status);
+	}
 
 	try {
-		const enriched = await upsertResource(c.env, raw, MAX_RESOURCES);
-		return c.json(enriched, 201);
-	} catch (err) {
-		if ((err as Error).message === "RESOURCE_LIMIT") {
-			return c.json(
-				{ error: `Resource limit reached (max ${MAX_RESOURCES}).` },
-				409,
-			);
-		}
-		throw err;
+		const images = normalizeImageResponse(parsed);
+		logs.push(event("SUCCESS", `Generated ${images.length} image result${images.length === 1 ? "" : "s"}.`));
+		return c.json({ requestId, elapsedMs, images, logs });
+	} catch (error) {
+		const result = errorResponse(requestId, "invalid_upstream_response", (error as Error).message, logs, 502);
+		return c.json(result, result.status);
 	}
-});
-
-app.post("/api/refresh", async (c) => {
-	if (!isAuthorized(c)) {
-		return c.json({ error: "Unauthorized. Set the ADMIN_TOKEN secret." }, 401);
-	}
-	await clearCache(c.env);
-	return c.json({
-		ok: true,
-		message: "Cache cleared; surfaces will re-enrich.",
-	});
-});
-
-// ---------------------------------------------------------------------------
-// OPTIONAL — Web Bot Auth identity surface (off by default)
-// ---------------------------------------------------------------------------
-
-app.get("/.well-known/web-bot-auth/directory", (c) => {
-	if (c.env.ENABLE_WEB_BOT_AUTH !== "true") return c.notFound();
-	return c.json(directoryDocument(SAMPLE_AGENT_KEYS));
-});
-
-app.all("/api/identity", async (c) => {
-	if (c.env.ENABLE_WEB_BOT_AUTH !== "true") {
-		return c.json({ error: "Web Bot Auth is disabled" }, 404);
-	}
-	const result = await verifyAgentIdentity(c.req.raw, SAMPLE_AGENT_KEYS);
-	return c.json(result);
 });
 
 export default app;
