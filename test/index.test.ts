@@ -26,7 +26,7 @@ function request(overrides: Record<string, unknown> = {}) {
 }
 
 describe("image generation proxy", () => {
-	it("returns URL and Base64 images with safe diagnostics", async () => {
+	it("returns URL and Base64 images with credential-redacted diagnostics", async () => {
 		fetchMock.get("https://api.example.com").intercept({ method: "POST", path: TARGET_PATH }).reply(200, {
 			data: [{ url: "https://cdn.example.com/a.png" }, { b64_json: "YWJj" }],
 		});
@@ -36,20 +36,43 @@ describe("image generation proxy", () => {
 		expect(json.images).toHaveLength(2);
 		const serialized = JSON.stringify(json.logs);
 		expect(serialized).not.toContain("top-secret-token");
-		expect(serialized).not.toContain("private prompt");
-		expect(serialized).not.toContain("YWJj");
-		expect(serialized).not.toContain("key=private");
+		expect(serialized).toContain("private prompt");
+		expect(serialized).toContain("YWJj");
+		expect(serialized).toContain("key=private");
 	});
 
 	it("returns detailed redacted upstream errors", async () => {
-		fetchMock.get("https://api.example.com").intercept({ method: "POST", path: TARGET_PATH }).reply(400, {
-			error: { message: "bad request", authorization: "top-secret-token" },
-		});
+		fetchMock.get("https://api.example.com").intercept({ method: "POST", path: TARGET_PATH }).reply(
+			400,
+			"bad request\nauthorization: Bearer upstream-secret\ncookie: visible-cookie",
+		);
 		const res = await request();
 		expect(res.status).toBe(502);
 		const text = await res.text();
 		expect(text).toContain("bad request");
 		expect(text).not.toContain("top-secret-token");
+		expect(text).not.toContain("upstream-secret");
+		expect(text).toContain("visible-cookie");
+	});
+
+	it("returns detailed upstream request and response logs with credential redaction", async () => {
+		fetchMock.get("https://api.example.com").intercept({ method: "POST", path: TARGET_PATH }).reply(525, {
+			error: { message: "TLS failed" },
+		}, { headers: { "content-type": "application/json", "cf-ray": "ray-123" } });
+		const res = await request();
+		const text = await res.text();
+		expect(res.status).toBe(502);
+		expect(text).toContain("POST");
+		expect(text).toContain(TARGET);
+		expect(text).toContain("private prompt");
+		expect(text).toContain("key=private");
+		expect(text).toMatch(/Request body bytes: \d+/);
+		expect(text).toContain("content-type");
+		expect(text).toContain("cf-ray");
+		expect(text).toContain("ray-123");
+		expect(text).toContain("TLS failed");
+		expect(text).not.toContain("top-secret-token");
+		expect(text).not.toContain("Bearer top-secret-token");
 	});
 
 	it("rejects unsafe targets before fetching", async () => {

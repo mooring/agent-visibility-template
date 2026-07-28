@@ -8,13 +8,15 @@ A Cloudflare Worker + React console for calling complete OpenAI-compatible image
 - OpenAI-compatible `data[].url` and `data[].b64_json` responses.
 - Standard fields: `model`, `prompt`, `n`, `size`, `quality`, `style`, `response_format`, `background`, `output_compression`, and `user`.
 - Extra JSON object for provider-specific parameters.
-- Detailed upstream HTTP errors and response bodies in the browser Logs panel.
-- Token, authorization headers, cookies, prompt contents, query strings, and Base64 image contents are excluded from diagnostics.
+- Detailed upstream request URLs, headers, bodies, response headers, HTTP errors, and response bodies in the browser Logs panel.
+- Token values and authorization headers are redacted from diagnostics. Other request and response content is logged unchanged.
 - Same-origin Worker proxy avoids browser CORS limitations.
 
 ## Security model
 
 The token stays in React component memory and the active Worker request. It is not written to local storage, cookies, KV, or Cloudflare configuration.
+
+The Logs panel intentionally includes prompts, cookies, URL query parameters, and Base64 image contents. Treat displayed or copied logs as sensitive data. Token values and `Authorization` header values are replaced with `[redacted]`.
 
 The Worker accepts only complete `https:` URLs, rejects embedded credentials, fragments, localhost/private/reserved IP literals, `.local`, and `.internal` targets, and does not follow redirects. Cloudflare Workers do not expose a general DNS-resolution API, so the application cannot independently prove every hostname's resolved IP before requesting it.
 

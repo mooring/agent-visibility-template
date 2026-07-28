@@ -23,8 +23,8 @@ test/image-generation.test.ts Pure validation and redaction tests
 
 ## Conventions
 
-- Never persist or log the user token, authorization values, cookies, prompt
-  contents, URL query strings/fragments, or Base64 image contents.
+- Never persist or log the user token or authorization values. Detailed browser
+  diagnostics intentionally retain other request and response content.
 - Only accept complete public HTTPS upstream URLs and never follow redirects.
 - Keep upstream response reading bounded and do not add automatic retries.
 - Keep form body construction and Worker validation as pure testable helpers.

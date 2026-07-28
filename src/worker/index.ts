@@ -2,7 +2,6 @@ import { Hono } from "hono";
 import {
 	normalizeImageResponse,
 	redactDiagnosticText,
-	sanitizeRequestBody,
 	validateGenerationRequest,
 	validatePublicHttpsUrl,
 	type DiagnosticEvent,
@@ -53,6 +52,29 @@ async function readBounded(response: Response) {
 	return { text: new TextDecoder().decode(bytes), truncated };
 }
 
+function redactCredentials(value: unknown, token: string): unknown {
+	if (typeof value === "string") return token ? value.split(token).join("[redacted]") : value;
+	if (Array.isArray(value)) return value.map((item) => redactCredentials(item, token));
+	if (!value || typeof value !== "object") return value;
+	return Object.fromEntries(Object.entries(value).map(([key, item]) =>
+		["token", "authorization"].includes(key.toLowerCase())
+			? [key, "[redacted]"]
+			: [key, redactCredentials(item, token)],
+	));
+}
+
+function redactCredentialText(text: string, token: string): string {
+	if (!text) return text;
+	const exactRedacted = token ? text.split(token).join("[redacted]") : text;
+	try { return JSON.stringify(redactCredentials(JSON.parse(exactRedacted), token)); }
+	catch {
+		return exactRedacted
+			.replace(/("(?:authorization|token)"\s*:\s*)"(?:\\.|[^"\\])*"/gi, "$1\"[redacted]\"")
+			.replace(/^(\s*(?:authorization|token)\s*:\s*).*$/gim, "$1[redacted]")
+			.replace(/((?:authorization|token)\s*=\s*)[^\s,;]+/gi, "$1[redacted]");
+	}
+}
+
 app.onError((error, c) => {
 	const requestId = crypto.randomUUID();
 	console.error(`[${requestId}] worker_error ${redactDiagnosticText(error.message)}`);
@@ -94,7 +116,16 @@ app.post("/api/images/generations", async (c) => {
 
 	const target = validatePublicHttpsUrl(request.url);
 	logs.push(event("INFO", `Validated public target ${target.safeTarget}.`));
-	logs.push(event("INFO", `Request parameters: ${JSON.stringify(sanitizeRequestBody(request.body))}`));
+	const requestBody = JSON.stringify(request.body);
+	const requestHeaders = {
+		accept: "application/json",
+		authorization: `Bearer ${request.token}`,
+		"content-type": "application/json",
+	};
+	logs.push(event("INFO", `Upstream request: POST ${target.url.toString()}.`));
+	logs.push(event("INFO", `Request headers: ${JSON.stringify(redactCredentials(requestHeaders, request.token))}`));
+	logs.push(event("INFO", `Request body bytes: ${new TextEncoder().encode(requestBody).byteLength}.`));
+	logs.push(event("INFO", `Request body: ${JSON.stringify(redactCredentials(request.body, request.token))}`));
 	const startedAt = Date.now();
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
@@ -103,12 +134,8 @@ app.post("/api/images/generations", async (c) => {
 	try {
 		upstream = await fetch(target.url, {
 			method: "POST",
-			headers: {
-				accept: "application/json",
-				authorization: `Bearer ${request.token}`,
-				"content-type": "application/json",
-			},
-			body: JSON.stringify(request.body),
+			headers: requestHeaders,
+			body: requestBody,
 			redirect: "manual",
 			signal: controller.signal,
 		});
@@ -116,6 +143,7 @@ app.post("/api/images/generations", async (c) => {
 		clearTimeout(timeout);
 		const timedOut = controller.signal.aborted;
 		const message = timedOut ? "Upstream request timed out." : "Could not reach the upstream service.";
+		logs.push(event("ERROR", `Upstream fetch error: ${(error as Error).name}: ${redactCredentialText((error as Error).message, request.token)}`));
 		console.error(`[${requestId}] upstream_network_error ${target.url.hostname} ${redactDiagnosticText((error as Error).message, [request.token])}`);
 		const result = errorResponse(requestId, timedOut ? "timeout" : "network_error", message, logs, timedOut ? 504 : 502);
 		return c.json(result, result.status);
@@ -125,11 +153,12 @@ app.post("/api/images/generations", async (c) => {
 	const elapsedMs = Date.now() - startedAt;
 	const body = await readBounded(upstream);
 	logs.push(event("INFO", `Upstream returned ${upstream.status} ${upstream.statusText || ""} in ${elapsedMs} ms.`.trim()));
-	logs.push(event("INFO", `Response content type: ${upstream.headers.get("content-type") || "unknown"}.`));
+	logs.push(event("INFO", `Response headers: ${JSON.stringify(redactCredentials(Object.fromEntries(upstream.headers.entries()), request.token))}`));
+	logs.push(event("INFO", `Response body: ${redactCredentialText(body.text, request.token)}`));
 	if (body.truncated) logs.push(event("ERROR", `Upstream response exceeded ${MAX_UPSTREAM_BYTES} bytes and was truncated.`));
 
 	if (!upstream.ok || upstream.status >= 300) {
-		const safeBody = redactDiagnosticText(body.text, [request.token]);
+		const safeBody = redactCredentialText(body.text, request.token);
 		const message = `Upstream request failed with ${upstream.status} ${upstream.statusText || ""}.`.trim();
 		const result = errorResponse(requestId, "upstream_error", message, logs, 502, {
 			status: upstream.status, statusText: upstream.statusText, body: safeBody, truncated: body.truncated,
