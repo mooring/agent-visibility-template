@@ -154,6 +154,7 @@ git commit -m "feat: add upstream TLS preflight logs"
 - Create: `src/react-app/theme.test.ts`
 - Modify: `src/react-app/App.tsx`
 - Modify: `src/react-app/App.css`
+- Modify: `src/react-app/index.css`
 - Modify: `README.md`
 
 **Interfaces:**

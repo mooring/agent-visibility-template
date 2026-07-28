@@ -11,6 +11,7 @@ A Cloudflare Worker + React console for calling complete OpenAI-compatible image
 - An unauthenticated HTTPS HEAD preflight runs before image generation and stops the formal request when Cloudflare returns 525 or the network check fails.
 - Detailed upstream request URLs, headers, bodies, response headers, HTTP errors, and response bodies in the browser Logs panel.
 - Token values and authorization headers are redacted from diagnostics. Other request and response content is logged unchanged.
+- Persistent dark and light themes; only the selected theme name is stored in local storage.
 - Same-origin Worker proxy avoids browser CORS limitations.
 
 ## Security model
