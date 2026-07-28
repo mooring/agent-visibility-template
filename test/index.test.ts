@@ -25,8 +25,15 @@ function request(overrides: Record<string, unknown> = {}) {
 	});
 }
 
+function preflight(status = 405) {
+	return fetchMock.get("https://api.example.com")
+		.intercept({ method: "HEAD", path: TARGET_PATH })
+		.reply(status);
+}
+
 describe("image generation proxy", () => {
 	it("returns URL and Base64 images with credential-redacted diagnostics", async () => {
+		preflight();
 		fetchMock.get("https://api.example.com").intercept({ method: "POST", path: TARGET_PATH }).reply(200, {
 			data: [{ url: "https://cdn.example.com/a.png" }, { b64_json: "YWJj" }],
 		});
@@ -42,6 +49,7 @@ describe("image generation proxy", () => {
 	});
 
 	it("returns detailed redacted upstream errors", async () => {
+		preflight();
 		fetchMock.get("https://api.example.com").intercept({ method: "POST", path: TARGET_PATH }).reply(
 			400,
 			"bad request\nauthorization: Bearer upstream-secret\ncookie: visible-cookie",
@@ -56,6 +64,7 @@ describe("image generation proxy", () => {
 	});
 
 	it("returns detailed upstream request and response logs with credential redaction", async () => {
+		preflight();
 		fetchMock.get("https://api.example.com").intercept({ method: "POST", path: TARGET_PATH }).reply(525, {
 			error: { message: "TLS failed" },
 		}, { headers: { "content-type": "application/json", "cf-ray": "ray-123" } });
@@ -75,12 +84,41 @@ describe("image generation proxy", () => {
 		expect(text).not.toContain("Bearer top-secret-token");
 	});
 
+	it("runs an unauthenticated TLS preflight before the formal request", async () => {
+		fetchMock.get("https://api.example.com").intercept({ method: "HEAD", path: TARGET_PATH }).reply((options) => {
+			expect(JSON.stringify(options.headers)).not.toContain("authorization");
+			expect(JSON.stringify(options.headers)).not.toContain("top-secret-token");
+			return { statusCode: 405, data: "" };
+		});
+		fetchMock.get("https://api.example.com").intercept({ method: "POST", path: TARGET_PATH }).reply(200, {
+			data: [{ url: "https://cdn.example.com/a.png" }],
+		});
+		const text = await (await request()).text();
+		expect(text).toContain("TLS preflight succeeded with HTTP 405");
+		expect(text).toContain("certificate and handshake details are unavailable");
+	});
+
+	it("stops before POST when TLS preflight returns 525", async () => {
+		fetchMock.get("https://api.example.com").intercept({ method: "HEAD", path: TARGET_PATH }).reply(
+			525,
+			"error code: 525",
+			{ headers: { "cf-ray": "ray-preflight" } },
+		);
+		const res = await request();
+		const text = await res.text();
+		expect(res.status).toBe(502);
+		expect(text).toContain("TLS preflight failed with 525");
+		expect(text).toContain("ray-preflight");
+		expect(text).toContain("Formal image generation request was skipped");
+	});
+
 	it("rejects unsafe targets before fetching", async () => {
 		const res = await request({ url: "https://127.0.0.1/images/generations" });
 		expect(res.status).toBe(400);
 	});
 
 	it("rejects redirects without following them", async () => {
+		preflight();
 		fetchMock.get("https://api.example.com").intercept({ method: "POST", path: TARGET_PATH }).reply(302, "moved", {
 			headers: { location: "https://other.example.com" },
 		});
@@ -91,6 +129,7 @@ describe("image generation proxy", () => {
 	});
 
 	it("reports malformed successful responses", async () => {
+		preflight();
 		fetchMock.get("https://api.example.com").intercept({ method: "POST", path: TARGET_PATH }).reply(200, { data: [] });
 		const res = await request();
 		expect(res.status).toBe(502);

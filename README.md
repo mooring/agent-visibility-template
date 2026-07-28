@@ -8,6 +8,7 @@ A Cloudflare Worker + React console for calling complete OpenAI-compatible image
 - OpenAI-compatible `data[].url` and `data[].b64_json` responses.
 - Standard fields: `model`, `prompt`, `n`, `size`, `quality`, `style`, `response_format`, `background`, `output_compression`, and `user`.
 - Extra JSON object for provider-specific parameters.
+- An unauthenticated HTTPS HEAD preflight runs before image generation and stops the formal request when Cloudflare returns 525 or the network check fails.
 - Detailed upstream request URLs, headers, bodies, response headers, HTTP errors, and response bodies in the browser Logs panel.
 - Token values and authorization headers are redacted from diagnostics. Other request and response content is logged unchanged.
 - Same-origin Worker proxy avoids browser CORS limitations.
@@ -21,6 +22,8 @@ The Logs panel intentionally includes prompts, cookies, URL query parameters, an
 The Worker accepts only complete `https:` URLs, rejects embedded credentials, fragments, localhost/private/reserved IP literals, `.local`, and `.internal` targets, and does not follow redirects. Cloudflare Workers do not expose a general DNS-resolution API, so the application cannot independently prove every hostname's resolved IP before requesting it.
 
 Upstream responses are read with a fixed limit. Requests are not retried automatically because image generation may be billable and is not guaranteed to be idempotent.
+
+The preflight treats any HTTP response other than 525, including 401 or 405, as proof that HTTPS reached the HTTP layer. Cloudflare Workers do not expose peer certificates, certificate chains, TLS versions, cipher suites, or handshake transcripts, so diagnostics state that boundary instead of claiming to inspect certificate details.
 
 ## Request parameter precedence
 

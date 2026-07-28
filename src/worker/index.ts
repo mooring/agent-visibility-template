@@ -116,6 +116,46 @@ app.post("/api/images/generations", async (c) => {
 
 	const target = validatePublicHttpsUrl(request.url);
 	logs.push(event("INFO", `Validated public target ${target.safeTarget}.`));
+	logs.push(event("INFO", `TLS preflight: HEAD ${target.url.toString()}.`));
+	logs.push(event("INFO", "Cloudflare Workers can verify HTTPS reachability, but certificate and handshake details are unavailable."));
+	const preflightStartedAt = Date.now();
+	const preflightController = new AbortController();
+	const preflightTimeout = setTimeout(() => preflightController.abort(), UPSTREAM_TIMEOUT_MS);
+	let preflightResponse: Response;
+	try {
+		preflightResponse = await fetch(target.url, {
+			method: "HEAD",
+			redirect: "manual",
+			signal: preflightController.signal,
+		});
+	} catch (error) {
+		clearTimeout(preflightTimeout);
+		const timedOut = preflightController.signal.aborted;
+		logs.push(event("ERROR", `TLS preflight fetch error: ${(error as Error).name}: ${redactCredentialText((error as Error).message, request.token)}`));
+		logs.push(event("ERROR", "Formal image generation request was skipped."));
+		const message = timedOut ? "TLS preflight timed out." : "TLS preflight could not reach the upstream service.";
+		const result = errorResponse(requestId, timedOut ? "timeout" : "network_error", message, logs, timedOut ? 504 : 502);
+		return c.json(result, result.status);
+	}
+	clearTimeout(preflightTimeout);
+	const preflightElapsedMs = Date.now() - preflightStartedAt;
+	if (preflightResponse.status === 525) {
+		const preflightBody = await readBounded(preflightResponse);
+		logs.push(event("ERROR", `TLS preflight failed with 525 in ${preflightElapsedMs} ms.`));
+		logs.push(event("INFO", `TLS preflight response headers: ${JSON.stringify(Object.fromEntries(preflightResponse.headers.entries()))}`));
+		logs.push(event("INFO", `TLS preflight response body: ${preflightBody.text}`));
+		logs.push(event("ERROR", "Formal image generation request was skipped."));
+		const message = "TLS preflight failed with 525.";
+		const result = errorResponse(requestId, "upstream_error", message, logs, 502, {
+			status: preflightResponse.status,
+			statusText: preflightResponse.statusText,
+			body: preflightBody.text,
+			truncated: preflightBody.truncated,
+		});
+		return c.json(result, result.status);
+	}
+	logs.push(event("INFO", `TLS preflight succeeded with HTTP ${preflightResponse.status} in ${preflightElapsedMs} ms.`));
+	await preflightResponse.body?.cancel();
 	const requestBody = JSON.stringify(request.body);
 	const requestHeaders = {
 		accept: "application/json",
