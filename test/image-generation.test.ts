@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
 	normalizeImageResponse,
 	redactDiagnosticText,
+	runWithTimeout,
 	sanitizeRequestBody,
 	validateGenerationRequest,
 	validatePublicHttpsUrl,
@@ -77,6 +78,17 @@ describe("image generation helpers", () => {
 		expect(text).not.toContain("private prompt");
 		expect(text).not.toContain("image-secret");
 		expect(text).not.toContain("api_key");
+	});
+
+	it("aborts and rejects operations that exceed their timeout", async () => {
+		let aborted = false;
+		await expect(runWithTimeout(1, (signal) => new Promise<void>((_resolve, reject) => {
+			signal.addEventListener("abort", () => {
+				aborted = true;
+				reject(new Error("operation aborted"));
+			});
+		}))).rejects.toMatchObject({ name: "TimeoutError" });
+		expect(aborted).toBe(true);
 	});
 
 	it("normalizes URL, Base64, and mixed image items in order", () => {

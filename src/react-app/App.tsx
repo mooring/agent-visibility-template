@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useLayoutEffect, useState } from "react";
 import type { DiagnosticEvent, GenerationImage } from "../lib/image-generation";
 import { buildGenerationBody, type GenerationFields } from "./generation-form";
+import { loadTheme, saveTheme, type Theme } from "./theme";
 import "./App.css";
 
 interface ApiResponse {
@@ -17,6 +18,7 @@ const INITIAL: GenerationFields = {
 };
 
 export default function App() {
+	const [theme, setTheme] = useState<Theme>(loadTheme);
 	const [token, setToken] = useState("");
 	const [url, setUrl] = useState("https://api.openai.com/v1/images/generations");
 	const [showToken, setShowToken] = useState(false);
@@ -25,6 +27,11 @@ export default function App() {
 	const [images, setImages] = useState<GenerationImage[]>([]);
 	const [stale, setStale] = useState(false);
 	const [logs, setLogs] = useState<DiagnosticEvent[]>([]);
+
+	useLayoutEffect(() => {
+		document.documentElement.dataset.theme = theme;
+		saveTheme(theme);
+	}, [theme]);
 
 	function addLog(level: DiagnosticEvent["level"], message: string) {
 		setLogs((current) => [...current, { time: new Date().toISOString(), level, message }]);
@@ -68,7 +75,7 @@ export default function App() {
 	}
 
 	return <main className="shell">
-		<header className="hero"><p className="eyebrow">Cloudflare Worker Proxy</p><h1>Image Generation Console</h1><p>Call any OpenAI-compatible public HTTPS image endpoint and inspect safe, detailed diagnostics in one place.</p></header>
+		<header className="hero"><div className="hero-row"><div className="hero-copy"><p className="eyebrow">Cloudflare Worker Proxy</p><h1>Image Generation Console</h1><p>Call any OpenAI-compatible public HTTPS image endpoint and inspect safe, detailed diagnostics in one place.</p></div><button className="theme-toggle" type="button" aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} theme`} onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>{theme === "dark" ? "Light theme" : "Dark theme"}</button></div></header>
 		<div className="workspace">
 			<form className="panel form" onSubmit={submit}>
 				<div className="panel-heading"><div><span>Request</span><h2>Generation settings</h2></div><span className="privacy">Token stays in memory</span></div>

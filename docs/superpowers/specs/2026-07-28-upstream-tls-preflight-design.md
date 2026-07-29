@@ -46,15 +46,18 @@ The existing diagnostic event stream records:
 - confirmation that the formal request was skipped after a preflight failure.
 
 Credential redaction remains unchanged. The preflight never receives or sends
-the user's token.
+the user's token. Preflight response headers and bodies pass through the same
+credential redaction used by the formal request before entering logs or the
+structured upstream error envelope.
 
 ## Resource handling
 
 The preflight response body is cancelled immediately after the status and
 headers needed for diagnostics are captured, except for a `525` response where
-the existing bounded reader captures the small diagnostic body. No retry is
-introduced. Each generation performs at most one preflight and one formal
-request.
+the existing bounded reader captures the small diagnostic body. The timeout
+remains active through fetch, bounded body reading, and response cancellation.
+No retry is introduced. Each generation performs at most one preflight and one
+formal request.
 
 ## Response behavior
 

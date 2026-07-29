@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import {
 	normalizeImageResponse,
 	redactDiagnosticText,
+	runWithTimeout,
 	validateGenerationRequest,
 	validatePublicHttpsUrl,
 	type DiagnosticEvent,
@@ -22,7 +23,7 @@ function errorResponse(
 	message: string,
 	logs: DiagnosticEvent[],
 	status: 400 | 502 | 504,
-	upstream?: { status: number; statusText: string; body?: string; truncated?: boolean },
+	upstream?: { status: number; statusText: string; headers?: Record<string, unknown>; body?: string; truncated?: boolean },
 ) {
 	return { error: { category, message }, requestId, upstream, logs: [...logs, event("ERROR", message)], status };
 }
@@ -116,6 +117,47 @@ app.post("/api/images/generations", async (c) => {
 
 	const target = validatePublicHttpsUrl(request.url);
 	logs.push(event("INFO", `Validated public target ${target.safeTarget}.`));
+	logs.push(event("INFO", `TLS preflight: HEAD ${target.url.toString()}.`));
+	logs.push(event("INFO", "Cloudflare Workers can verify HTTPS reachability, but certificate and handshake details are unavailable."));
+	const preflightStartedAt = Date.now();
+	let preflightResponse: Response;
+	let preflightBody: { text: string; truncated: boolean } | undefined;
+	try {
+		const result = await runWithTimeout(UPSTREAM_TIMEOUT_MS, async (signal) => {
+			const response = await fetch(target.url, { method: "HEAD", redirect: "manual", signal });
+			if (response.status === 525) return { response, body: await readBounded(response) };
+			await response.body?.cancel();
+			return { response, body: undefined };
+		});
+		preflightResponse = result.response;
+		preflightBody = result.body;
+	} catch (error) {
+		const timedOut = (error as Error).name === "TimeoutError";
+		logs.push(event("ERROR", `TLS preflight fetch error: ${(error as Error).name}: ${redactCredentialText((error as Error).message, request.token)}`));
+		logs.push(event("ERROR", "Formal image generation request was skipped."));
+		const message = timedOut ? "TLS preflight timed out." : "TLS preflight could not reach the upstream service.";
+		const result = errorResponse(requestId, timedOut ? "timeout" : "network_error", message, logs, timedOut ? 504 : 502);
+		return c.json(result, result.status);
+	}
+	const preflightElapsedMs = Date.now() - preflightStartedAt;
+	if (preflightResponse.status === 525) {
+		const safeHeaders = redactCredentials(Object.fromEntries(preflightResponse.headers.entries()), request.token) as Record<string, unknown>;
+		const safeBody = redactCredentialText(preflightBody?.text ?? "", request.token);
+		logs.push(event("ERROR", `TLS preflight failed with 525 in ${preflightElapsedMs} ms.`));
+		logs.push(event("INFO", `TLS preflight response headers: ${JSON.stringify(safeHeaders)}`));
+		logs.push(event("INFO", `TLS preflight response body: ${safeBody}`));
+		logs.push(event("ERROR", "Formal image generation request was skipped."));
+		const message = "TLS preflight failed with 525.";
+		const result = errorResponse(requestId, "upstream_error", message, logs, 502, {
+			status: preflightResponse.status,
+			statusText: preflightResponse.statusText,
+			headers: safeHeaders,
+			body: safeBody,
+			truncated: preflightBody?.truncated,
+		});
+		return c.json(result, result.status);
+	}
+	logs.push(event("INFO", `TLS preflight succeeded with HTTP ${preflightResponse.status} in ${preflightElapsedMs} ms.`));
 	const requestBody = JSON.stringify(request.body);
 	const requestHeaders = {
 		accept: "application/json",
