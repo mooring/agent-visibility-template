@@ -17,6 +17,9 @@ Changing the theme updates `data-theme` on the document root and writes only
 the theme name to local storage. Tokens, URLs, prompts, request parameters,
 images, and logs remain in memory and are not persisted.
 
+If browser policy makes local storage unavailable, the console falls back to
+dark mode and theme switching continues without crashing the page.
+
 ## Interface
 
 A theme button appears in the hero header and displays the theme the user can

@@ -18,6 +18,21 @@ export interface GenerationRequest {
 	body: Record<string, unknown>;
 }
 
+export async function runWithTimeout<T>(timeoutMs: number, operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+	const controller = new AbortController();
+	let timeout: ReturnType<typeof setTimeout> | undefined;
+	const timeoutResult = new Promise<never>((_resolve, reject) => {
+		timeout = setTimeout(() => {
+			const error = new Error("Operation timed out.");
+			error.name = "TimeoutError";
+			reject(error);
+			controller.abort();
+		}, timeoutMs);
+	});
+	try { return await Promise.race([operation(controller.signal), timeoutResult]); }
+	finally { if (timeout !== undefined) clearTimeout(timeout); }
+}
+
 const PRIVATE_V4 = [
 	/^0\./,
 	/^10\./,

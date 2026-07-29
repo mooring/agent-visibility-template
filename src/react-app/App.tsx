@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useLayoutEffect, useState } from "react";
 import type { DiagnosticEvent, GenerationImage } from "../lib/image-generation";
 import { buildGenerationBody, type GenerationFields } from "./generation-form";
-import { parseTheme, type Theme } from "./theme";
+import { loadTheme, saveTheme, type Theme } from "./theme";
 import "./App.css";
 
 interface ApiResponse {
@@ -18,7 +18,7 @@ const INITIAL: GenerationFields = {
 };
 
 export default function App() {
-	const [theme, setTheme] = useState<Theme>(() => parseTheme(localStorage.getItem("image-console-theme")));
+	const [theme, setTheme] = useState<Theme>(loadTheme);
 	const [token, setToken] = useState("");
 	const [url, setUrl] = useState("https://api.openai.com/v1/images/generations");
 	const [showToken, setShowToken] = useState(false);
@@ -28,9 +28,9 @@ export default function App() {
 	const [stale, setStale] = useState(false);
 	const [logs, setLogs] = useState<DiagnosticEvent[]>([]);
 
-	useEffect(() => {
+	useLayoutEffect(() => {
 		document.documentElement.dataset.theme = theme;
-		localStorage.setItem("image-console-theme", theme);
+		saveTheme(theme);
 	}, [theme]);
 
 	function addLog(level: DiagnosticEvent["level"], message: string) {

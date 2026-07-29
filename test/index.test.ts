@@ -101,14 +101,28 @@ describe("image generation proxy", () => {
 	it("stops before POST when TLS preflight returns 525", async () => {
 		fetchMock.get("https://api.example.com").intercept({ method: "HEAD", path: TARGET_PATH }).reply(
 			525,
-			"error code: 525",
-			{ headers: { "cf-ray": "ray-preflight" } },
+			JSON.stringify({ authorization: "Bearer body-secret", token: "body-secret" }),
+			{ headers: { authorization: "Bearer upstream-secret", "cf-ray": "ray-preflight", "x-request-token": "top-secret-token" } },
 		);
 		const res = await request();
 		const text = await res.text();
 		expect(res.status).toBe(502);
 		expect(text).toContain("TLS preflight failed with 525");
 		expect(text).toContain("ray-preflight");
+		expect(text).toContain("Formal image generation request was skipped");
+		expect(text).not.toContain("top-secret-token");
+		expect(text).not.toContain("upstream-secret");
+		expect(text).not.toContain("body-secret");
+	});
+
+	it("stops before POST when TLS preflight cannot connect", async () => {
+		fetchMock.get("https://api.example.com")
+			.intercept({ method: "HEAD", path: TARGET_PATH })
+			.replyWithError(new Error("connection refused"));
+		const res = await request();
+		const text = await res.text();
+		expect(res.status).toBe(502);
+		expect(text).toContain("TLS preflight fetch error: Error: connection refused");
 		expect(text).toContain("Formal image generation request was skipped");
 	});
 
